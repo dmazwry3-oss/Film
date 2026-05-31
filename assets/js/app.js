@@ -296,7 +296,7 @@ function renderWatch(stream, ctx) {
          </div>`
       : "";
 
-  const genres = stream.genre
+  const genres = stream.genre && stream.genre.length
     ? (Array.isArray(stream.genre) ? stream.genre : String(stream.genre).split(/[,/]/))
         .map((g) => `<span class="chip">${esc(String(g).trim())}</span>`)
         .join("")

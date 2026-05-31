@@ -173,15 +173,34 @@ async function request(path, params, { source = "pinedrama" } = {}) {
 
 /* ---------- normalizers ---------- */
 
+/** Prettify slug-like strings (the news endpoint returns Title as a slug). */
+function prettifyTitle(t) {
+  const s = String(t || "");
+  if (/^[a-z0-9]+(-[a-z0-9]+)+$/.test(s)) {
+    return s.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return s;
+}
+
+/** Normalize a genre value (string, CSV, or [{Name}]) into an array of names. */
+function genreNames(g) {
+  if (!g) return [];
+  const arr = Array.isArray(g) ? g : String(g).split(/[,/|]/);
+  return arr
+    .map((x) => (x && typeof x === "object" ? pick(x, ["name", "title", "label"]) : x))
+    .map((s) => decodeEntities(String(s || "").trim()))
+    .filter(Boolean);
+}
+
 /** Normalize a single list item into a card-friendly shape. */
 export function normalizeItem(raw, source = "pinedrama") {
   if (!raw || typeof raw !== "object") return null;
-  const title = decodeEntities(pick(raw, [
+  const title = prettifyTitle(decodeEntities(pick(raw, [
     "title", "name", "judul", "drama_title", "bookName", "book_name", "movie_name",
-  ], "Tanpa Judul"));
+  ], "Tanpa Judul")));
 
   let poster = pick(raw, [
-    "poster", "image", "img", "thumbnail", "thumb", "cover", "gambar",
+    "poster", "image", "img", "thumbnail", "thumb", "cover", "coverThumb", "gambar",
     "coverImg", "cover_image", "image_url", "picture", "banner",
   ], "");
   // PineDrama returns its logo as a placeholder when no real poster exists.
@@ -194,16 +213,26 @@ export function normalizeItem(raw, source = "pinedrama") {
     "eps", "chapterCount", "total", "totalEpisodes", "episode",
   ]);
 
+  // DramaBox stream endpoint keys on the dasherized English title (titleEn).
+  const titleEn = pick(raw, ["titleEn", "title_en"]);
+
+  // Rating can be a flat field or nested under ratings.average.
+  let rating = pick(raw, ["rating", "score", "imdb", "vote"], "");
+  if (!rating) {
+    const ratings = pick(raw, ["ratings"]);
+    if (ratings && typeof ratings === "object") rating = pick(ratings, ["average", "avg"], "");
+  }
+
   return {
     source,
     title,
     poster,
     slug,
-    titleSlug: slugify(title), // dramabox keys on dasherized title
+    titleSlug: titleEn ? String(titleEn) : slugify(title),
     episodes: episodes != null ? String(episodes) : "",
     type: pick(raw, ["type", "category", "kategori", "label"], ""),
     year: pick(raw, ["year", "tahun", "release", "release_year"], ""),
-    rating: pick(raw, ["rating", "score", "imdb", "vote"], ""),
+    rating: rating ? String(rating) : "",
     genre: pick(raw, ["genre", "genres", "tags", "category"], ""),
     synopsis: decodeEntities(pick(raw, ["synopsis", "description", "desc", "sinopsis", "overview", "intro", "introduction"], "")),
     raw,
@@ -378,7 +407,7 @@ export function normalizeStream(data, source = "pinedrama") {
     title: decodeEntities(pick(meta, ["title", "name", "judul", "drama_title", "bookName", "book_name"], "")),
     poster: pick(meta, ["cover", "poster", "image", "thumbnail", "img", "coverImg"], ""),
     synopsis: decodeEntities(pick(meta, ["introduction", "synopsis", "description", "desc", "sinopsis", "overview", "intro"], "")),
-    genre: pick(meta, ["genres", "genre", "tags"], ""),
+    genre: genreNames(pick(meta, ["genres", "genre", "tags"])),
     year: pick(meta, ["year", "tahun", "release", "release_year"], ""),
     rating: pick(meta, ["rating", "score", "viewCount"], ""),
     stream,
@@ -414,7 +443,7 @@ function deepFindStream(node, depth = 0) {
 export function normalizeEpisodes(data) {
   const obj = asObject(data);
   let arr = asArray(
-    pick(obj, ["episodes", "episode_list", "episodeList", "eps", "chapters", "list"]) || []
+    pick(obj, ["episodes", "episode_list", "episodeList", "eps", "chapters", "list", "all_streams", "allStreams"]) || []
   );
   // Some detail payloads put episodes at the top level.
   if (!arr.length) arr = asArray(data);
