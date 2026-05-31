@@ -1,0 +1,46 @@
+# ============================================================
+# Netlify deployment config for DramaVerse
+# ------------------------------------------------------------
+# The site is fully static (no build step). The only server-side
+# piece is a tiny serverless function that proxies /api/* to the
+# upstream drama API so the browser never makes a cross-origin
+# request (no CORS errors) and we can send browser-like headers
+# (the upstream rejects generic requests with HTTP 403).
+# ============================================================
+
+[build]
+  # Repo root holds index.html, so publish from the root.
+  publish = "."
+  # No build step needed; this keeps Netlify from failing when it
+  # detects package.json and looks for a build script.
+  command = "echo 'No build step — static site.'"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Browser calls same-origin /api/... -> routed to the proxy function.
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/proxy/:splat"
+  status = 200
+  force = true
+
+# ------------------------------------------------------------
+# ALTERNATIVE (simpler) without a function — Netlify can proxy
+# directly to the upstream. Use this ONLY if the upstream does not
+# block requests based on User-Agent/Referer headers. If you hit
+# 403s, keep the function-based redirect above instead.
+#
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://api-xemoz-official.my.id/api/drachin/:splat"
+#   status = 200
+#   force = true
+# ------------------------------------------------------------
+
+# Light caching for static assets.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=86400"
