@@ -11,9 +11,24 @@ import { CONFIG, buildUrl } from "./config.js";
 
 /* ---------- low-level helpers ---------- */
 
-let lastDebug = { url: "", data: null };
+// Rolling log of recent API calls (newest first), including failures.
+// Used by the on-screen debug panel so the real response shape can be
+// inspected from the browser.
+const MAX_LOG = 10;
+let debugLog = [];
+function logEntry(entry) {
+  debugLog.unshift({ time: new Date().toLocaleTimeString(), ...entry });
+  if (debugLog.length > MAX_LOG) debugLog.length = MAX_LOG;
+}
+export function getDebugLog() {
+  return debugLog;
+}
 export function getLastDebug() {
-  return lastDebug;
+  return debugLog[0] || { url: "", data: null };
+}
+/** Allow other modules (e.g. the player) to annotate the latest entry. */
+export function noteDebug(note) {
+  if (debugLog[0]) debugLog[0].note = note;
 }
 
 /** Pick the first defined, non-empty value among several keys. */
@@ -99,6 +114,7 @@ async function request(path, params, { source = "pinedrama" } = {}) {
   try {
     res = await fetch(url, { headers: { Accept: "application/json" } });
   } catch (err) {
+    logEntry({ url, ok: false, error: "network: " + String(err && err.message) });
     const e = new Error(
       "Tidak bisa terhubung ke API. Kemungkinan diblokir CORS atau jaringan."
     );
@@ -107,15 +123,8 @@ async function request(path, params, { source = "pinedrama" } = {}) {
     throw e;
   }
 
-  if (!res.ok) {
-    const e = new Error(`API mengembalikan status ${res.status}.`);
-    e.code = "http";
-    e.status = res.status;
-    throw e;
-  }
-
-  let data;
   const text = await res.text();
+  let data;
   try {
     data = JSON.parse(text);
   } catch (_) {
@@ -123,7 +132,16 @@ async function request(path, params, { source = "pinedrama" } = {}) {
     data = text;
   }
 
-  lastDebug = { url, data };
+  if (!res.ok) {
+    logEntry({ url, ok: false, status: res.status, data });
+    const e = new Error(`API mengembalikan status ${res.status}.`);
+    e.code = "http";
+    e.status = res.status;
+    e.data = data;
+    throw e;
+  }
+
+  logEntry({ url, ok: true, status: res.status, data });
   return data;
 }
 
@@ -223,31 +241,60 @@ function humanizeKey(key) {
 export function normalizeStream(data, source = "pinedrama") {
   const obj = asObject(data);
 
-  // Stream URL: look across many likely fields, including nested ones.
-  let stream =
-    pick(obj, [
-      "stream", "stream_url", "streamUrl", "url", "video", "video_url",
-      "videoUrl", "file", "source", "m3u8", "hls", "play_url", "playUrl",
-      "embed", "embed_url", "iframe", "link",
-    ]) || deepFindStream(data);
-
-  // Sometimes the stream lives in a `sources`/`servers` array.
   const servers = [];
-  const serverArr = asArray(pick(obj, ["sources", "servers", "server", "qualities", "links"]) || []);
+  const pushServer = (label, url) => {
+    if (url && typeof url === "string") servers.push({ label: label || "Server", url });
+  };
+
+  // Direct single-field stream candidates.
+  let stream = pick(obj, [
+    "stream", "stream_url", "streamUrl", "url", "video", "video_url",
+    "videoUrl", "videoPath", "video_path", "playPath", "playUrl", "play_url",
+    "file", "source", "m3u8", "hls", "mp4", "cdnUrl", "embed", "embed_url",
+    "iframe", "link",
+  ]);
+
+  // `sources` / `servers` / `qualities` arrays.
+  const serverArr = asArray(
+    pick(obj, ["sources", "servers", "server", "qualities", "links", "videoList"]) || []
+  );
   for (const s of serverArr) {
-    const u = pick(s, ["url", "file", "src", "link", "stream", "m3u8", "play_url"]);
-    if (u) servers.push({ label: pick(s, ["label", "quality", "name", "server", "resolution"], "Server"), url: u });
+    if (typeof s === "string") { pushServer("Server", s); continue; }
+    const u = pick(s, ["url", "file", "src", "link", "stream", "m3u8", "mp4", "videoPath", "play_url"]);
+    pushServer(pick(s, ["label", "quality", "name", "server", "resolution"], "Server"), u);
   }
-  if (!stream && servers.length) stream = servers[0].url;
+
+  // DramaBox-style cdnList: [{ cdnDomain/url, videoPathList: [{ quality, videoPath }] }]
+  const cdnList = asArray(pick(obj, ["cdnList", "cdn_list", "cdn"]) || []);
+  for (const cdn of cdnList) {
+    if (typeof cdn !== "object") continue;
+    const base = pick(cdn, ["cdnDomain", "domain", "url", "host"], "");
+    const join = (p) => (/^https?:\/\//i.test(p) ? p : (base ? base.replace(/\/$/, "") + "/" + String(p).replace(/^\//, "") : p));
+    const vpl = asArray(pick(cdn, ["videoPathList", "videoPaths", "list", "qualities"]) || []);
+    for (const v of vpl) {
+      const p = pick(v, ["videoPath", "url", "path", "file"]);
+      if (p) pushServer((pick(v, ["quality", "label", "resolution"], "") + "").toString() || "CDN", join(p));
+    }
+    const direct = pick(cdn, ["videoPath", "url"]);
+    if (direct) pushServer(pick(cdn, ["quality", "label"], "CDN"), join(direct));
+  }
+
+  // Last resort: scan the whole payload for a URL that looks like a video.
+  if (!stream && !servers.length) stream = deepFindStream(data);
+  if (!stream && servers.length) {
+    // Prefer an absolute http(s) server URL if available.
+    const abs = servers.find((s) => /^https?:\/\//i.test(s.url));
+    stream = (abs || servers[0]).url;
+  }
 
   // Download links.
   const downloads = [];
-  const dlArr = asArray(pick(obj, ["download", "downloads", "download_url", "dl"]) || []);
+  const dlArr = asArray(pick(obj, ["download", "downloads", "download_url", "dl", "downloadList"]) || []);
   for (const d of dlArr) {
     if (typeof d === "string") {
       downloads.push({ label: "Unduh", url: d });
     } else {
-      const u = pick(d, ["url", "link", "file", "download", "src"]);
+      const u = pick(d, ["url", "link", "file", "download", "src", "videoPath"]);
       if (u) downloads.push({ label: pick(d, ["quality", "label", "resolution", "name"], "Unduh"), url: u });
     }
   }
@@ -256,9 +303,9 @@ export function normalizeStream(data, source = "pinedrama") {
 
   return {
     source,
-    title: pick(obj, ["title", "name", "judul", "drama_title", "bookName"], ""),
-    poster: pick(obj, ["poster", "image", "thumbnail", "cover", "img"], ""),
-    synopsis: pick(obj, ["synopsis", "description", "desc", "sinopsis", "overview"], ""),
+    title: pick(obj, ["title", "name", "judul", "drama_title", "bookName", "book_name"], ""),
+    poster: pick(obj, ["poster", "image", "thumbnail", "cover", "img", "coverImg"], ""),
+    synopsis: pick(obj, ["synopsis", "description", "desc", "sinopsis", "overview", "intro"], ""),
     genre: pick(obj, ["genre", "genres", "tags"], ""),
     year: pick(obj, ["year", "tahun", "release"], ""),
     rating: pick(obj, ["rating", "score"], ""),

@@ -70,7 +70,10 @@
   <aside class="debug" id="debugPanel" hidden>
     <div class="debug__head">
       <strong>Debug — respons API mentah</strong>
-      <button class="debug__close" id="debugClose" aria-label="Tutup">✕</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn--ghost btn--sm" id="debugCopy" type="button">Salin</button>
+        <button class="debug__close" id="debugClose" aria-label="Tutup">✕</button>
+      </div>
     </div>
     <p class="debug__hint">
       Panel ini menampilkan URL dan JSON terakhir yang diterima dari API. Berguna untuk

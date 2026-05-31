@@ -5,7 +5,8 @@
 
 import { CONFIG } from "./config.js";
 import {
-  api, normalizeList, normalizeHome, normalizeStream, getLastDebug, slugify,
+  api, normalizeList, normalizeHome, normalizeStream,
+  getLastDebug, getDebugLog, noteDebug, slugify,
 } from "./api.js";
 import {
   esc, cardHtml, gridHtml, sectionHtml, skeletonGrid, stateHtml,
@@ -344,6 +345,23 @@ function mountPlayer(url, poster, title) {
         <div>
           <div style="font-size:2.4rem">🎞️</div>
           <p>Tautan streaming tidak ditemukan pada respons API untuk episode ini.</p>
+          <p class="footer__muted">Buka <strong>Mode debug</strong> di bawah untuk melihat respons mentah.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // Guard: a non-absolute URL would resolve against our own site and show
+  // the host's 404 page inside the player. Surface it clearly instead.
+  if (!/^https?:\/\//i.test(url)) {
+    noteDebug("stream URL bukan absolut: " + url);
+    frame.innerHTML = `
+      <div class="player__empty">
+        <div>
+          <div style="font-size:2.4rem">🔗</div>
+          <p>API mengembalikan tautan stream yang tidak lengkap (bukan URL absolut):</p>
+          <p><code style="word-break:break-all">${esc(url)}</code></p>
+          <p class="footer__muted">Buka <strong>Mode debug</strong>, salin JSON-nya, lalu kirim ke pengembang untuk dipetakan ke field yang benar.</p>
         </div>
       </div>`;
     return;
@@ -422,12 +440,46 @@ function router() {
 function refreshDebug() {
   const panel = document.getElementById("debugPanel");
   if (panel.hidden) return;
-  const { url, data } = getLastDebug();
   const body = document.getElementById("debugBody");
-  let pretty;
-  try { pretty = JSON.stringify(data, null, 2); } catch (_) { pretty = String(data); }
-  if (pretty && pretty.length > 6000) pretty = pretty.slice(0, 6000) + "\n… (dipotong)";
-  body.textContent = `GET ${url}\n\n${pretty || "Belum ada data."}`;
+  const log = getDebugLog();
+
+  if (!log.length) {
+    body.textContent = "Belum ada permintaan. Buka sebuah halaman dulu (beranda / cari / tonton).";
+    return;
+  }
+
+  const blocks = log.map((e) => {
+    let pretty;
+    try { pretty = JSON.stringify(e.data, null, 2); } catch (_) { pretty = String(e.data); }
+    if (pretty && pretty.length > 4000) pretty = pretty.slice(0, 4000) + "\n… (dipotong)";
+    const status = e.ok ? `OK ${e.status || ""}` : `GAGAL ${e.status || ""} ${e.error || ""}`;
+    const note = e.note ? `\n# catatan: ${e.note}` : "";
+    return `# [${e.time}] ${status}\nGET ${e.url}${note}\n${pretty ?? ""}`;
+  });
+
+  body.textContent = blocks.join("\n\n────────────────────────\n\n");
+}
+
+function copyDebug() {
+  const log = getDebugLog();
+  const text = JSON.stringify(log, null, 2);
+  const done = () => toast("Log debug disalin ke clipboard");
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (_) {}
+  ta.remove();
 }
 
 /* ---------- chrome (nav, search, debug) ---------- */
@@ -462,6 +514,7 @@ function initChrome() {
   document.getElementById("debugClose").addEventListener("click", () => {
     panel.hidden = true;
   });
+  document.getElementById("debugCopy").addEventListener("click", copyDebug);
 
   window.addEventListener("hashchange", router);
 }
