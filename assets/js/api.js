@@ -31,32 +31,59 @@ export function noteDebug(note) {
   if (debugLog[0]) debugLog[0].note = note;
 }
 
-/** Pick the first defined, non-empty value among several keys. */
+/** Case-insensitive single-key lookup (the PineDrama API uses Title/Slug/Image). */
+function getCI(obj, key) {
+  if (!obj || typeof obj !== "object") return undefined;
+  if (key in obj) return obj[key];
+  const lk = key.toLowerCase();
+  for (const k of Object.keys(obj)) {
+    if (k.toLowerCase() === lk) return obj[k];
+  }
+  return undefined;
+}
+
+/** Pick the first defined, non-empty value among several keys (case-insensitive). */
 function pick(obj, keys, fallback = undefined) {
   if (!obj || typeof obj !== "object") return fallback;
   for (const k of keys) {
-    const v = obj[k];
+    const v = getCI(obj, k);
     if (v !== undefined && v !== null && v !== "") return v;
   }
   return fallback;
 }
 
-/** Find the most relevant array inside an arbitrary response. */
+/** Decode HTML entities (titles arrive like "Mrs. Marshal&#x27;s ..."). */
+export function decodeEntities(str) {
+  if (str == null) return "";
+  return String(str)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
+
+/** Find the most relevant array inside an arbitrary response (case-insensitive keys). */
 function asArray(data) {
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== "object") return [];
 
   const named = [
-    "data", "result", "results", "items", "list", "rows",
+    "result", "results", "data", "items", "list", "rows",
     "dramas", "drama", "episodes", "episode", "videos", "content",
     "data_list", "lists", "movies", "series", "response",
   ];
   for (const k of named) {
-    if (Array.isArray(data[k])) return data[k];
+    const v = getCI(data, k);
+    if (Array.isArray(v)) return v;
     // one level deeper, e.g. { data: { list: [...] } }
-    if (data[k] && typeof data[k] === "object") {
+    if (v && typeof v === "object") {
       for (const k2 of named) {
-        if (Array.isArray(data[k][k2])) return data[k][k2];
+        const v2 = getCI(v, k2);
+        if (Array.isArray(v2)) return v2;
       }
     }
   }
@@ -74,10 +101,9 @@ function asArray(data) {
 function asObject(data) {
   if (!data || typeof data !== "object") return {};
   if (Array.isArray(data)) return data[0] || {};
-  for (const k of ["data", "result", "detail", "info", "drama", "response"]) {
-    if (data[k] && typeof data[k] === "object" && !Array.isArray(data[k])) {
-      return data[k];
-    }
+  for (const k of ["data", "result", "detail", "info", "response"]) {
+    const v = getCI(data, k);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
   }
   return data;
 }
@@ -150,20 +176,22 @@ async function request(path, params, { source = "pinedrama" } = {}) {
 /** Normalize a single list item into a card-friendly shape. */
 export function normalizeItem(raw, source = "pinedrama") {
   if (!raw || typeof raw !== "object") return null;
-  const title = pick(raw, [
+  const title = decodeEntities(pick(raw, [
     "title", "name", "judul", "drama_title", "bookName", "book_name", "movie_name",
-  ], "Tanpa Judul");
+  ], "Tanpa Judul"));
 
-  const poster = pick(raw, [
+  let poster = pick(raw, [
     "poster", "image", "img", "thumbnail", "thumb", "cover", "gambar",
     "coverImg", "cover_image", "image_url", "picture", "banner",
   ], "");
+  // PineDrama returns its logo as a placeholder when no real poster exists.
+  if (/\/Logo\.svg($|\?)/i.test(poster)) poster = "";
 
   const slug = deriveSlug(raw);
 
   const episodes = pick(raw, [
     "total_episode", "total_episodes", "episodes", "episode_count",
-    "eps", "chapterCount", "total", "episode",
+    "eps", "chapterCount", "total", "totalEpisodes", "episode",
   ]);
 
   return {
@@ -177,7 +205,7 @@ export function normalizeItem(raw, source = "pinedrama") {
     year: pick(raw, ["year", "tahun", "release", "release_year"], ""),
     rating: pick(raw, ["rating", "score", "imdb", "vote"], ""),
     genre: pick(raw, ["genre", "genres", "tags", "category"], ""),
-    synopsis: pick(raw, ["synopsis", "description", "desc", "sinopsis", "overview", "intro"], ""),
+    synopsis: decodeEntities(pick(raw, ["synopsis", "description", "desc", "sinopsis", "overview", "intro", "introduction"], "")),
     raw,
   };
 }
@@ -217,6 +245,8 @@ export function normalizeHome(data) {
 
 function humanizeKey(key) {
   const map = {
+    result: "Drama Pilihan",
+    data: "Drama Pilihan",
     latest: "Terbaru",
     new: "Terbaru",
     news: "Terbaru",
@@ -237,83 +267,128 @@ function humanizeKey(key) {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/** Collect playable URLs from a stream node that may nest .stream.{mp4,m3u8}. */
+function collectStreams(node, push) {
+  if (!node) return;
+  if (typeof node === "string") { push("Server", node); return; }
+  if (typeof node !== "object") return;
+  // DramaBox nests the real URLs one level down: { episode, ..., stream: { mp4, m3u8 } }
+  const inner = node.stream && typeof node.stream === "object" ? node.stream : node;
+  const mp4 = pick(inner, ["mp4"]);
+  const m3u8 = pick(inner, ["m3u8", "hls"]);
+  if (mp4) push("MP4", mp4);
+  if (m3u8) push("HLS", m3u8);
+}
+
+/** Rank URLs so a directly-playable MP4 is preferred over HLS/embeds. */
+function rankUrl(u) {
+  if (/\.mp4(\?|$)/i.test(u)) return 3;
+  if (/\.m3u8(\?|$)/i.test(u)) return 2;
+  return 1;
+}
+
 /** Extract playable stream + downloads + episode list from a detail payload. */
 export function normalizeStream(data, source = "pinedrama") {
-  const obj = asObject(data);
+  const root = asObject(data);
+  const dramaObj = pick(root, ["drama", "book", "info", "detail"]);
+  const meta = dramaObj && typeof dramaObj === "object" ? dramaObj : root;
 
   const servers = [];
+  const seen = new Set();
   const pushServer = (label, url) => {
-    if (url && typeof url === "string") servers.push({ label: label || "Server", url });
+    if (url && typeof url === "string" && /^https?:\/\//i.test(url) && !seen.has(url)) {
+      seen.add(url);
+      servers.push({ label: label || "Server", url });
+    }
   };
 
-  // Direct single-field stream candidates.
-  let stream = pick(obj, [
-    "stream", "stream_url", "streamUrl", "url", "video", "video_url",
-    "videoUrl", "videoPath", "video_path", "playPath", "playUrl", "play_url",
-    "file", "source", "m3u8", "hls", "mp4", "cdnUrl", "embed", "embed_url",
-    "iframe", "link",
-  ]);
+  // 1) Current-episode stream node (DramaBox: root.stream.stream.{mp4,m3u8}).
+  const streamNode = pick(root, ["stream", "video", "playInfo", "play"]);
+  collectStreams(streamNode, pushServer);
 
-  // `sources` / `servers` / `qualities` arrays.
+  // 2) Generic single-field URLs at the root / meta.
+  const directUrl = pick(root, [
+    "stream_url", "streamUrl", "url", "video_url", "videoUrl", "videoPath",
+    "playPath", "playUrl", "play_url", "file", "m3u8", "hls", "mp4",
+    "embed", "embed_url", "iframe", "link",
+  ]);
+  if (typeof directUrl === "string") pushServer("Server", directUrl);
+
+  // 3) sources / qualities arrays.
   const serverArr = asArray(
-    pick(obj, ["sources", "servers", "server", "qualities", "links", "videoList"]) || []
+    pick(root, ["sources", "servers", "server", "qualities", "links", "videoList"]) || []
   );
   for (const s of serverArr) {
     if (typeof s === "string") { pushServer("Server", s); continue; }
-    const u = pick(s, ["url", "file", "src", "link", "stream", "m3u8", "mp4", "videoPath", "play_url"]);
+    const u = pick(s, ["mp4", "m3u8", "url", "file", "src", "link", "stream", "videoPath", "play_url"]);
     pushServer(pick(s, ["label", "quality", "name", "server", "resolution"], "Server"), u);
   }
 
-  // DramaBox-style cdnList: [{ cdnDomain/url, videoPathList: [{ quality, videoPath }] }]
-  const cdnList = asArray(pick(obj, ["cdnList", "cdn_list", "cdn"]) || []);
+  // 4) DramaBox-style cdnList: [{ cdnDomain, videoPathList: [{ quality, videoPath }] }]
+  const cdnList = asArray(pick(root, ["cdnList", "cdn_list", "cdn"]) || []);
   for (const cdn of cdnList) {
     if (typeof cdn !== "object") continue;
     const base = pick(cdn, ["cdnDomain", "domain", "url", "host"], "");
     const join = (p) => (/^https?:\/\//i.test(p) ? p : (base ? base.replace(/\/$/, "") + "/" + String(p).replace(/^\//, "") : p));
     const vpl = asArray(pick(cdn, ["videoPathList", "videoPaths", "list", "qualities"]) || []);
     for (const v of vpl) {
-      const p = pick(v, ["videoPath", "url", "path", "file"]);
-      if (p) pushServer((pick(v, ["quality", "label", "resolution"], "") + "").toString() || "CDN", join(p));
+      const p = pick(v, ["videoPath", "url", "path", "file", "mp4"]);
+      if (p) pushServer(String(pick(v, ["quality", "label", "resolution"], "CDN")), join(p));
     }
-    const direct = pick(cdn, ["videoPath", "url"]);
-    if (direct) pushServer(pick(cdn, ["quality", "label"], "CDN"), join(direct));
   }
 
-  // Last resort: scan the whole payload for a URL that looks like a video.
-  if (!stream && !servers.length) stream = deepFindStream(data);
-  if (!stream && servers.length) {
-    // Prefer an absolute http(s) server URL if available.
-    const abs = servers.find((s) => /^https?:\/\//i.test(s.url));
-    stream = (abs || servers[0]).url;
+  // 5) Last resort: scan the whole payload for a video-looking URL.
+  if (!servers.length) {
+    const found = deepFindStream(data);
+    if (found) pushServer("Server", found);
   }
+
+  // Prefer a directly-playable MP4 as the active stream.
+  servers.sort((a, b) => rankUrl(b.url) - rankUrl(a.url));
+  const stream = servers.length ? servers[0].url : "";
 
   // Download links.
   const downloads = [];
-  const dlArr = asArray(pick(obj, ["download", "downloads", "download_url", "dl", "downloadList"]) || []);
+  const dlArr = asArray(pick(root, ["download", "downloads", "download_url", "dl", "downloadList"]) || []);
   for (const d of dlArr) {
     if (typeof d === "string") {
       downloads.push({ label: "Unduh", url: d });
     } else {
-      const u = pick(d, ["url", "link", "file", "download", "src", "videoPath"]);
+      const u = pick(d, ["url", "link", "file", "download", "src", "mp4", "videoPath"]);
       if (u) downloads.push({ label: pick(d, ["quality", "label", "resolution", "name"], "Unduh"), url: u });
     }
   }
-  const singleDl = pick(obj, ["download_url", "downloadUrl"]);
-  if (singleDl && !downloads.length) downloads.push({ label: "Unduh", url: singleDl });
+  // DramaBox: also offer the resolved MP4 as a download.
+  if (!downloads.length) {
+    const mp4 = servers.find((s) => /\.mp4(\?|$)/i.test(s.url));
+    if (mp4) downloads.push({ label: "MP4 720p", url: mp4.url });
+  }
+
+  const lockedFlag =
+    (streamNode && typeof streamNode === "object" && (pick(streamNode, ["locked"]) === true)) ||
+    pick(root, ["locked"]) === true;
+
+  const recommendations = normalizeList(
+    pick(root, ["recommendations", "recommend", "related", "recommendList"]) || [],
+    source
+  );
 
   return {
     source,
-    title: pick(obj, ["title", "name", "judul", "drama_title", "bookName", "book_name"], ""),
-    poster: pick(obj, ["poster", "image", "thumbnail", "cover", "img", "coverImg"], ""),
-    synopsis: pick(obj, ["synopsis", "description", "desc", "sinopsis", "overview", "intro"], ""),
-    genre: pick(obj, ["genre", "genres", "tags"], ""),
-    year: pick(obj, ["year", "tahun", "release"], ""),
-    rating: pick(obj, ["rating", "score"], ""),
-    stream: stream || "",
+    title: decodeEntities(pick(meta, ["title", "name", "judul", "drama_title", "bookName", "book_name"], "")),
+    poster: pick(meta, ["cover", "poster", "image", "thumbnail", "img", "coverImg"], ""),
+    synopsis: decodeEntities(pick(meta, ["introduction", "synopsis", "description", "desc", "sinopsis", "overview", "intro"], "")),
+    genre: pick(meta, ["genres", "genre", "tags"], ""),
+    year: pick(meta, ["year", "tahun", "release", "release_year"], ""),
+    rating: pick(meta, ["rating", "score", "viewCount"], ""),
+    stream,
+    locked: lockedFlag,
     servers,
     downloads,
+    recommendations,
     episodes: normalizeEpisodes(data),
-    currentEp: pick(obj, ["ep", "episode", "current_episode", "episode_number"], ""),
+    currentEp: pick(streamNode && typeof streamNode === "object" ? streamNode : {}, ["episode", "ep"]) ||
+      pick(root, ["ep", "episode", "current_episode", "episode_number"], ""),
     raw: data,
   };
 }
@@ -335,7 +410,7 @@ function deepFindStream(node, depth = 0) {
   return "";
 }
 
-/** Build an episode list, normalizing into { number, label, slug, ep, url }. */
+/** Build an episode list: { number, label, ep, slug, url, locked }. */
 export function normalizeEpisodes(data) {
   const obj = asObject(data);
   let arr = asArray(
@@ -349,17 +424,19 @@ export function normalizeEpisodes(data) {
       if (e == null) return null;
       if (typeof e === "number" || typeof e === "string") {
         const n = String(e);
-        return { number: n, label: `Eps ${n}`, ep: n, slug: "", url: "" };
+        return { number: n, label: `Eps ${n}`, ep: n, slug: "", url: "", locked: false };
       }
       const num = pick(e, [
         "ep", "episode", "number", "no", "index", "chapter", "episode_number",
       ], String(i + 1));
+      const locked = pick(e, ["unlock"]) === false || pick(e, ["locked"]) === true;
       return {
         number: String(num),
-        label: pick(e, ["title", "name", "label"], `Eps ${num}`),
+        label: decodeEntities(pick(e, ["title", "name", "label"], `Eps ${num}`)),
         ep: String(num),
         slug: deriveSlug(e),
-        url: pick(e, ["url", "link", "stream", "file"], ""),
+        url: pick(e, ["mp4", "url", "link", "stream", "file"], ""),
+        locked,
       };
     })
     .filter(Boolean);

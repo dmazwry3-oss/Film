@@ -15,6 +15,7 @@ import {
 
 const view = document.getElementById("view");
 let activeHls = null;
+let watchServers = [];
 
 /* ---------- helpers ---------- */
 
@@ -235,6 +236,7 @@ async function pageWatch(params) {
 
 function renderWatch(stream, ctx) {
   const { source, ep, slug, title } = ctx;
+  watchServers = stream.servers || [];
   const meta = [];
   if (stream.currentEp || ep) meta.push("Episode " + esc(stream.currentEp || ep));
   if (stream.year) meta.push(esc(stream.year));
@@ -243,11 +245,14 @@ function renderWatch(stream, ctx) {
 
   // Episode list (fall back to a sensible range if none provided).
   let episodes = stream.episodes;
-  if (!episodes.length && stream.episodes.length === 0) {
-    const total = parseInt(stream.raw?.total_episode || stream.raw?.episodes || 0, 10);
+  if (!episodes.length) {
+    const total = parseInt(
+      stream.raw?.total_episode || stream.raw?.totalEpisodes ||
+      stream.raw?.data?.drama?.totalEpisodes || stream.raw?.episodes || 0, 10
+    );
     if (total > 0 && total < 2000) {
       episodes = Array.from({ length: total }, (_, i) => ({
-        ep: String(i + 1), number: String(i + 1), label: `Eps ${i + 1}`,
+        ep: String(i + 1), number: String(i + 1), label: `Eps ${i + 1}`, locked: false,
       }));
     }
   }
@@ -261,8 +266,8 @@ function renderWatch(stream, ctx) {
     ? `<div class="eplist">
          ${episodes
            .map(
-             (e) => `<a class="ep ${String(e.ep) === String(ep) ? "is-active" : ""}"
-               href="${epHref(e)}">${esc(e.number)}</a>`
+             (e) => `<a class="ep ${String(e.ep) === String(ep) ? "is-active" : ""} ${e.locked ? "ep--locked" : ""}"
+               href="${epHref(e)}" title="${e.locked ? "Terkunci di sumber" : esc(e.label || "Eps " + e.number)}">${esc(e.number)}${e.locked ? '<span class="ep__lock">🔒</span>' : ""}</a>`
            )
            .join("")}
        </div>`
@@ -293,9 +298,14 @@ function renderWatch(stream, ctx) {
 
   const genres = stream.genre
     ? (Array.isArray(stream.genre) ? stream.genre : String(stream.genre).split(/[,/]/))
-        .map((g) => `<span class="chip">${esc(g.trim())}</span>`)
+        .map((g) => `<span class="chip">${esc(String(g).trim())}</span>`)
         .join("")
     : "";
+
+  const recsHtml =
+    stream.recommendations && stream.recommendations.length
+      ? sectionHtml("✨ Rekomendasi", stream.recommendations.slice(0, 12), { rail: true })
+      : "";
 
   view.innerHTML = `
     <div class="watch">
@@ -318,9 +328,14 @@ function renderWatch(stream, ctx) {
         ${epListHtml}
         ${downloadsHtml ? `<h3 class="sidebar__title" style="margin-top:18px">Unduhan</h3>${downloadsHtml}` : ""}
       </aside>
-    </div>`;
+    </div>
+    ${recsHtml}`;
 
-  mountPlayer(stream.stream, stream.poster, stream.title);
+  if (!stream.stream && stream.locked) {
+    showPlayerMessage("🔒", "Episode ini terkunci di sumbernya (perlu akun/koin di aplikasi aslinya). Coba episode yang masih terbuka.");
+  } else {
+    mountPlayer(stream.stream, stream.poster, stream.title);
+  }
 
   // Server switching.
   view.querySelectorAll(".chip[data-srv]").forEach((btn) => {
@@ -331,6 +346,18 @@ function renderWatch(stream, ctx) {
       mountPlayer(btn.dataset.srv, stream.poster, stream.title);
     });
   });
+}
+
+function showPlayerMessage(icon, msg) {
+  const frame = document.getElementById("playerFrame");
+  if (!frame) return;
+  frame.innerHTML = `
+    <div class="player__empty">
+      <div>
+        <div style="font-size:2.4rem">${icon}</div>
+        <p>${msg}</p>
+      </div>
+    </div>`;
 }
 
 /** Mount the appropriate player for a stream URL (HLS, mp4, or iframe embed). */
@@ -383,28 +410,39 @@ function mountPlayer(url, poster, title) {
   frame.innerHTML = "";
   frame.appendChild(video);
 
+  // When a direct file fails, try an alternate server (e.g. HLS) before giving up.
+  const tryAlternate = (failedUrl) => {
+    const alt = watchServers.find((s) => s.url !== failedUrl);
+    if (alt) {
+      toast("Mencoba server lain…");
+      mountPlayer(alt.url, poster, title);
+    } else {
+      showPlayerMessage(
+        "⚠️",
+        `Video tidak bisa diputar di sini (tautan mungkin kedaluwarsa atau diblokir). ` +
+        `<br /><a class="btn btn--ghost btn--sm" style="margin-top:12px" href="${esc(failedUrl)}" target="_blank" rel="noopener">Buka di tab baru</a>`
+      );
+    }
+  };
+
   if (isHls) {
     if (window.Hls && window.Hls.isSupported()) {
       activeHls = new window.Hls({ maxBufferLength: 30 });
       activeHls.loadSource(url);
       activeHls.attachMedia(video);
       activeHls.on(window.Hls.Events.ERROR, (_e, data) => {
-        if (data.fatal) {
-          toast("Gagal memutar HLS, mencoba pemutar bawaan…");
-          frame.innerHTML = `<iframe src="${esc(url)}" allowfullscreen></iframe>`;
-        }
+        if (data.fatal) { destroyPlayer(); tryAlternate(url); }
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = url; // Safari native HLS
+      video.addEventListener("error", () => tryAlternate(url));
     } else {
-      frame.innerHTML = `<iframe src="${esc(url)}" allowfullscreen></iframe>`;
+      tryAlternate(url);
     }
   } else {
-    // Assume a progressive file (mp4/webm) or a directly playable URL.
+    // Progressive file (mp4/webm). Plays cross-origin without CORS.
     video.src = url;
-    video.addEventListener("error", () => {
-      frame.innerHTML = `<iframe src="${esc(url)}" allow="autoplay; fullscreen" allowfullscreen></iframe>`;
-    });
+    video.addEventListener("error", () => tryAlternate(url));
   }
 }
 

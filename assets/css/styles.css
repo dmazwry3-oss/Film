@@ -467,3 +467,9 @@ button { font-family: inherit; cursor: pointer; }
   .hero { min-height: 320px; }
   .hero__content { padding: 22px; }
 }
+
+
+/* ---------- Locked episodes ---------- */
+.ep--locked { opacity: 0.5; }
+.ep--locked:hover { border-color: var(--border); transform: none; }
+.ep__lock { font-size: 0.65em; margin-left: 2px; }
